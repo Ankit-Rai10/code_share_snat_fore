@@ -120,4 +120,25 @@ def impute_future_exogenous_features(df, feature_cols_to_impute, steps_ahead=6, 
         last_row.name = future_date
         future_forecasts[future_date] = step_forecast
 
+    # --- Plot Full Series with Forecast ---
+    for col in feature_cols_to_impute:
+        full_series = pd.concat([
+            df_features[[col]].iloc[:-steps_ahead],
+            pd.DataFrame(
+                [v[col] for v in future_forecasts.values()],
+                index=future_forecasts.keys(),
+                columns=[col]
+            )
+        ])
+        plt.figure(figsize=(10, 4))
+        plt.plot(full_series.index, full_series[col], label='Full Series with Forecast', marker='o')
+        plt.axvline(x=df_features.index[-1], color='red', linestyle='--', label='Forecast Start')
+        plt.title(f"{col}: Historical + Forecast")
+        plt.xlabel("Date")
+        plt.ylabel(col)
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
     return future_forecasts, imputation_results
