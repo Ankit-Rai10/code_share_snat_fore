@@ -108,3 +108,13 @@ def impute_future_exogenous_features(df, feature_cols_to_impute, steps_ahead=6, 
         future_forecasts[future_date] = step_forecast
 
     return future_forecasts, imputation_results
+
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 5))
+plt.plot(y_test.values, label='Actual')
+plt.plot(y_pred, label='Predicted')
+plt.title(f'Prediction for {col}')
+plt.legend()
+plt.show()
