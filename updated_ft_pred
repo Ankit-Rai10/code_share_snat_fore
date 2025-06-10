@@ -3,9 +3,9 @@ import pandas as pd
 import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import matplotlib.pyplot as plt
-from pandas.tseries.offsets import MonthBegin
+from pandas.tseries.offsets import Week
 
-def impute_future_exogenous_features(df, feature_cols_to_impute, steps_ahead=6, test_size=0.2):
+def fill_exogeneous_features_v2(df, feature_cols_to_impute, steps_ahead=2, test_size=0.05):
     def create_time_features(df, date_col):
         df = df.copy()
         df[date_col] = pd.to_datetime(df[date_col])
@@ -39,16 +39,10 @@ def impute_future_exogenous_features(df, feature_cols_to_impute, steps_ahead=6, 
 
     # Ensure datetime index
     df = df.copy()
-    if not isinstance(df.index, pd.DatetimeIndex):
-        if 'ds' in df.columns:
-            df['ds'] = pd.to_datetime(df['ds'])
-            df.set_index('ds', inplace=True)
-        else:
-            raise ValueError("DataFrame must have a DatetimeIndex or a 'ds' column with datetime values.")
-
     # --- Feature Engineering ---
-    df_features = create_time_features(df, df.index.name)
+    df_features = create_time_features(df, 'ds')
     df_features = create_lag_features(df_features, feature_cols_to_impute)
+    df_features = df_features.dropna(subset='Total_Target_CALLS')
 
     # Feature selection (exclude raw, diff, unique_id, etc.)
     feature_cols = [
@@ -87,6 +81,7 @@ def impute_future_exogenous_features(df, feature_cols_to_impute, steps_ahead=6, 
         y_pred = model.predict(X_test)
         mae = mean_absolute_error(y_test, y_pred)
         rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        print(y_test)
 
         imputation_results[col] = {
             'MAE': mae,
@@ -110,7 +105,7 @@ def impute_future_exogenous_features(df, feature_cols_to_impute, steps_ahead=6, 
     future_forecasts = {}
     last_row = df_features.iloc[-1:].copy()
     last_date = pd.to_datetime(df_features.index[-1])
-    future_dates = pd.date_range(start=last_date + MonthBegin(1), periods=steps_ahead, freq='MS')
+    future_dates = pd.date_range(start=last_date + Week(1,weekday=4), periods=steps_ahead, freq='W-FRI')
 
     for step, future_date in enumerate(future_dates):
         step_forecast = {}
@@ -129,8 +124,6 @@ def impute_future_exogenous_features(df, feature_cols_to_impute, steps_ahead=6, 
 
         last_row.name = future_date
         future_forecasts[future_date] = step_forecast
-
-    # --- Plot Full Series with Forecast ---
     for col in feature_cols_to_impute:
         original_series = df[[col]]
         forecast_series = pd.DataFrame(
@@ -138,16 +131,27 @@ def impute_future_exogenous_features(df, feature_cols_to_impute, steps_ahead=6, 
             index=future_forecasts.keys(),
             columns=[col]
         )
-        full_series = pd.concat([original_series, forecast_series])
-        plt.figure(figsize=(10, 4))
-        plt.plot(full_series.index, full_series[col], label='Full Series with Forecast', marker='o')
-        plt.axvline(x=df.index[-1], color='red', linestyle='--', label='Forecast Start')
-        plt.title(f"{col}: Historical + Forecast")
-        plt.xlabel("Date")
-        plt.ylabel(col)
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
+        print(original_series)
+#         full_series = pd.concat([original_series, forecast_series])
 
-    return future_forecasts, imputation_results
+    # --- Plot Full Series with Forecast ---
+#     for col in feature_cols_to_impute:
+#         original_series = df[[col]]
+#         forecast_series = pd.DataFrame(
+#             [v[col] for v in future_forecasts.values()],
+#             index=future_forecasts.keys(),
+#             columns=[col]
+#         )
+#         full_series = pd.concat([original_series, forecast_series])
+#         plt.figure(figsize=(10, 4))
+#         plt.plot(full_series.index, full_series[col], label='Full Series with Forecast', marker='o')
+#         plt.axvline(x=df.index[-1], color='red', linestyle='--', label='Forecast Start')
+#         plt.title(f"{col}: Historical + Forecast")
+#         plt.xlabel("Date")
+#         plt.ylabel(col)
+#         plt.legend()
+#         plt.grid(True)
+#         plt.tight_layout()
+#         plt.show()
+
+    return future_forecasts, imputation_results, full_series
