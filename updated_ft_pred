@@ -1,4 +1,9 @@
-def fill_exogeneous_features_v2(df, target_cols,steps_ahead,test_size=0.2,maxlags=12):
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+def impute_future_exogenous_features(df, feature_cols_to_impute, steps_ahead=6, test_size=0.2):
     def create_time_features(df, date_col):
         df = df.copy()
         df[date_col] = pd.to_datetime(df[date_col])
@@ -18,53 +23,45 @@ def fill_exogeneous_features_v2(df, target_cols,steps_ahead,test_size=0.2,maxlag
         df['is_year_end'] = df.index.is_year_end.astype(int)
         return df
 
-    def create_lag_features(df, target_cols, lags=[1, 2, 3, 4, 12]):
+    def create_lag_features(df, cols, lags=[1, 2, 3, 4, 12]):
         df = df.copy()
-        for col in target_cols:
+        for col in cols:
             if col in df.columns:
                 for lag in lags:
                     df[f'{col}_lag_{lag}'] = df[col].shift(lag)
-                df[f'{col}_roll_3'] = df[col].rolling(3).mean()
-                df[f'{col}_roll_6'] = df[col].rolling(6).mean()
-                df[f'{col}_roll_12'] = df[col].rolling(12).mean()
-                df[f'{col}_pct_change'] = df[col].pct_change()
+                for win in [3, 6, 12]:
+                    df[f'{col}_roll_{win}'] = df[col].rolling(win).mean()
+                df[f'{col}_pct_change'] = df[col].pct_change().replace([np.inf, -np.inf], np.nan)
                 df[f'{col}_diff'] = df[col].diff()
         return df
 
-    def check_stationarity(series):
-        result = adfuller(series.dropna())
-        return result[1] < 0.05
-
-    def prepare_var_data(df, target_cols):
-        var_data = df[target_cols].copy()
-        for col in target_cols:
-            if not check_stationarity(var_data[col]):
-                var_data[f'{col}_diff'] = var_data[col].diff()
-                print(f"Applied differencing to {col}")
-        return var_data.dropna()
-
-    # --- XGBoost Training ---
+    # --- Feature Engineering ---
     df_features = create_time_features(df, df.index.name or 'ds')
-    df_features = create_lag_features(df_features, target_cols)
-    feature_cols = [col for col in df_features.columns if col not in [target_cols,'unique_id'] and not col.endswith('_diff')]
-    print('#########################################')
-    print(feature_cols)
-    print('#########################################')
-    
+    df_features = create_lag_features(df_features, feature_cols_to_impute)
+
+    # Feature selection (exclude raw, diff, unique_id, etc.)
+    feature_cols = [
+        col for col in df_features.columns
+        if col not in feature_cols_to_impute and not col.endswith('_diff') and col != 'unique_id'
+    ]
+
+    # Train/Test split
     split_idx = int(len(df_features) * (1 - test_size))
     train_data = df_features.iloc[:split_idx]
     test_data = df_features.iloc[split_idx:]
-    xgb_models = {}
-    results = {}
 
-    for target_col in target_cols:
-        print(f"\nTraining XGBoost for {target_col}...")
-        X_train = train_data[feature_cols].fillna(0)
-        y_train = train_data[target_col].fillna(0)
-        X_test = test_data[feature_cols].fillna(0)
-        y_test = test_data[target_col].fillna(0)
-        print('starting_regressor')
-        xgb_model = xgb.XGBRegressor(
+    xgb_models = {}
+    imputation_results = {}
+
+    for col in feature_cols_to_impute:
+        print(f"Training model for {col} imputation...")
+
+        X_train = train_data[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+        y_train = train_data[col].fillna(0)
+        X_test = test_data[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+        y_test = test_data[col].fillna(0)
+
+        model = xgb.XGBRegressor(
             n_estimators=100,
             max_depth=6,
             learning_rate=0.1,
@@ -72,74 +69,42 @@ def fill_exogeneous_features_v2(df, target_cols,steps_ahead,test_size=0.2,maxlag
             colsample_bytree=0.8,
             random_state=42
         )
-#         print(X_train)
-        xgb_model.fit(X_train, y_train)
-        xgb_models[target_col] = xgb_model
-        y_pred = xgb_model.predict(X_test)
+        model.fit(X_train, y_train)
+
+        xgb_models[col] = model
+
+        y_pred = model.predict(X_test)
         mae = mean_absolute_error(y_test, y_pred)
         rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-        results[target_col] = {
+
+        imputation_results[col] = {
             'MAE': mae,
             'RMSE': rmse,
-            'Feature_Importance': dict(zip(feature_cols, xgb_model.feature_importances_))
+            'Feature_Importance': dict(zip(feature_cols, model.feature_importances_))
         }
-        print(f"MAE: {mae:.4f}, RMSE: {rmse:.4f}")
 
-    # --- VAR Training ---
-    try:
-        var_data = prepare_var_data(df, target_cols)
-        var_model = VAR(var_data)
-        var_fit = var_model.fit(maxlags=maxlags, ic='aic')
-        print(f"VAR model fitted with {var_fit.k_ar} lags")
-        print(f"AIC: {var_fit.aic}")
-        var_available = True
-    except Exception as e:
-        print(f"VAR fitting failed: {e}")
-        var_fit = None
-        var_available = False
+    # --- Future Imputation ---
+    future_forecasts = {}
+    last_row = df_features.iloc[-1:].copy()
+    last_date = df_features.index[-1]
+    future_dates = pd.date_range(start=last_date + pd.offsets.MonthBegin(), periods=steps_ahead, freq='MS')
 
-    # --- Forecasting ---
-    # XGBoost forecast
-    df_features = create_time_features(df, df.index.name or 'ds')
-    df_features = create_lag_features(df_features, target_cols)
-    forecasts_xgb = {}
-    last_data = df_features.iloc[-1:].copy()
-    for step in range(steps_ahead):
-        step_forecasts = {}
-        for target_col in target_cols:
-            if target_col in xgb_models:
-                X_pred = last_data[feature_cols].fillna(0)
-                pred = xgb_models[target_col].predict(X_pred)[0]
-                step_forecasts[target_col] = pred
-        for target_col, pred in step_forecasts.items():
-            if target_col not in forecasts_xgb:
-                forecasts_xgb[target_col] = []
-            forecasts_xgb[target_col].append(pred)
-            last_data[target_col] = pred
+    for step, future_date in enumerate(future_dates):
+        step_forecast = {}
+        for col in feature_cols_to_impute:
+            X_pred = last_row[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+            pred = xgb_models[col].predict(X_pred)[0]
+            step_forecast[col] = pred
+            last_row[col] = pred
 
-    # VAR forecast
-    if var_available:
-        try:
-            var_forecasts = var_fit.forecast(var_fit.y, steps=steps_ahead)
-        except Exception as e:
-            print(f"VAR forecasting failed: {e}")
-            var_available = False
+        for col in feature_cols_to_impute:
+            for lag in [1, 2, 3, 4, 12]:
+                last_row[f'{col}_lag_{lag}'] = last_row[col]
+            for win in [3, 6, 12]:
+                last_row[f'{col}_roll_{win}'] = last_row[col]
+            last_row[f'{col}_pct_change'] = 0
 
-    # Combine forecasts
-    if var_available:
-        combined_forecasts = {}
-        for i, target_col in enumerate(target_cols):
-            if target_col in forecasts_xgb:
-                var_vals = var_forecasts[:, i]
-                xgb_vals = forecasts_xgb[target_col]
-                combined_forecasts[target_col] = [
-                    (v + x) / 2 for v, x in zip(var_vals, xgb_vals)
-                ]
-    else:
-        combined_forecasts = forecasts_xgb
+        last_row.name = future_date
+        future_forecasts[future_date] = step_forecast
 
-    print("\nForecasts for next", steps_ahead, "months:")
-    for target_col, values in combined_forecasts.items():
-        print(f"{target_col}: {[round(v, 2) for v in values]}")
-
-    return combined_forecasts, results
+    return future_forecasts, imputation_results
