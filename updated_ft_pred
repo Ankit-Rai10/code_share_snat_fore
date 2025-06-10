@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+import matplotlib.pyplot as plt
 
 def impute_future_exogenous_features(df, feature_cols_to_impute, steps_ahead=6, test_size=0.2):
     def create_time_features(df, date_col):
@@ -83,6 +84,18 @@ def impute_future_exogenous_features(df, feature_cols_to_impute, steps_ahead=6, 
             'Feature_Importance': dict(zip(feature_cols, model.feature_importances_))
         }
 
+        # --- Plotting actual vs predicted ---
+        plt.figure(figsize=(10, 4))
+        plt.plot(y_test.values, label='Actual', marker='o')
+        plt.plot(y_pred, label='Predicted', marker='x')
+        plt.title(f"Actual vs Predicted for {col}")
+        plt.xlabel("Time Steps")
+        plt.ylabel(col)
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
     # --- Future Imputation ---
     future_forecasts = {}
     last_row = df_features.iloc[-1:].copy()
@@ -108,13 +121,3 @@ def impute_future_exogenous_features(df, feature_cols_to_impute, steps_ahead=6, 
         future_forecasts[future_date] = step_forecast
 
     return future_forecasts, imputation_results
-
-
-import matplotlib.pyplot as plt
-
-plt.figure(figsize=(10, 5))
-plt.plot(y_test.values, label='Actual')
-plt.plot(y_pred, label='Predicted')
-plt.title(f'Prediction for {col}')
-plt.legend()
-plt.show()
