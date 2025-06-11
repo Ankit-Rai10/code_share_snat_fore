@@ -1,0 +1,138 @@
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+def fill_exogeneous_features_v2(df, feature_names, cv_threshold, val_fh, debug=True):
+    unique_id = df['unique_id'].unique()[0]
+    columns_imputed = []
+    df_summary = pd.DataFrame()
+
+    n_trials = 10
+    n_parallel = 1
+    seed = 42
+    lags_to_consider = [1, 2, 3, 4, 12]
+    uni_models = {'xgboost': AutoXGBoost(),
+                 'autoridge': AutoRidge()}
+
+    for column in feature_names:
+        if debug:
+            print(f"\nProcessing column: {column}")
+            print(df[[column, 'ds']].tail(20))
+
+        series = df[column]
+        first_valid_pos1 = series.first_valid_index()
+        if debug:
+            print('First valid index:', first_valid_pos1)
+
+        series.iloc[:first_valid_pos1] = 0
+        nan_pos = series.isna().idxmax() if series.isna().any() else None
+
+        if nan_pos is None:
+            continue  # skip columns without NaNs
+
+        n_nan = series.iloc[nan_pos:].isna().sum()
+        if debug:
+            print(f"n_nan: {n_nan}")
+
+        # Prepare data
+        df_copy = df[['ds', 'unique_id', column]].copy()
+        df_copy.rename(columns={column: 'y'}, inplace=True)
+
+        # Split data
+        train_data = df_copy.iloc[:len(df_copy)-n_nan-val_fh]
+        val_data = df_copy.iloc[len(df_copy)-n_nan-val_fh:len(df_copy)-n_nan]
+        test_data = df_copy.iloc[-n_nan:]
+        train_holdout_data = pd.concat([train_data, val_data])
+        if debug:
+            print(f"Train: {train_data.shape}, Val: {val_data.shape}, Test: {test_data.shape}")
+
+        # Define configs
+        def my_init_config(trial):
+            return {
+                'lags': lags_to_consider,
+                'date_features': ['month', 'week'],
+                'lag_transforms': {1: [RollingMean(window_size=4)]}
+            }
+
+        def my_fit_config(trial):
+            return {'static_features': []}
+
+        # Train AutoML on train
+        fcst = AutoMLForecast(
+            models=uni_models,
+            freq='W-FRI',
+            num_threads=n_parallel,
+            init_config=my_init_config,
+            fit_config=my_fit_config
+        ).fit(
+            train_data[['ds', 'unique_id', 'y']],
+            n_windows=3,
+            h=val_fh,
+            num_samples=n_trials,
+            fitted=True,
+            study_kwargs={'sampler': optuna.samplers.TPESampler(seed=seed)}
+        )
+
+        # Forecast on validation
+        forecast_val_df = fcst.predict(h=val_fh)
+        merged_val = forecast_val_df.merge(val_data[['ds', 'y']], on='ds', how='left')
+
+        merged_val.dropna(inplace=True)
+        y_true = merged_val['y']
+        y_pred = merged_val['xgboost']
+
+        mae = mean_absolute_error(y_true, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        mape = np.mean(np.abs((y_true - y_pred) / np.clip(y_true, 1e-8, None))) * 100  # avoid division by 0
+        print('xgboost: ',mae,rmse,mape)
+
+        # Retrain on train+val
+        models_to_retrain = {
+            model_name: fcst.models_[model_name].models_[model_name]
+            for model_name in fcst.models_
+        }
+
+        fcst_final = MLForecast(
+            models=models_to_retrain,
+            lags=lags_to_consider,
+            date_features=['month', 'week'],
+            freq='W-FRI',
+        ).fit(train_holdout_data[['ds', 'unique_id', 'y']], static_features=[], fitted=True)
+
+        forecast_test_df = fcst_final.predict(h=n_nan)
+        
+        print('--------------forecast_val_df--------------------')
+        print(forecast_val_df)
+        print('------------------------forecast_test_df---------------')
+        print(forecast_test_df)
+
+        if debug:
+            plt.figure(figsize=(10, 4))
+            plt.plot(df_copy['ds'], df_copy['y'], label='Actual')
+            plt.plot(forecast_val_df['ds'], forecast_val_df['xgboost'], label='Val Forecast', linestyle='--')
+            plt.plot(forecast_test_df['ds'], forecast_test_df['xgboost'], label='Test Forecast')
+            plt.axvline(x=df_copy['ds'].iloc[len(df_copy) - n_nan], color='r', linestyle='--', label='Forecast Start')
+            plt.title(f'{column} - Forecast Imputation')
+            plt.xlabel("Date")
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.show()
+
+        replicate = forecast_test_df['xgboost']
+        df[column].iloc[nan_pos:] = replicate.values
+
+        df_dummy = pd.DataFrame({
+            'unique_id': unique_id,
+            'Feature_Name': column,
+            'n_imputations': n_nan,
+            'MAE': mae,
+            'RMSE': rmse,
+            'MAPE': mape
+        }, index=[0])
+
+        df_summary = pd.concat([df_summary, df_dummy], ignore_index=True)
+        columns_imputed.append(column)
+
+    print("Imputed columns:", columns_imputed)
+    if debug:
+        print("Summary:\n", df_summary)
+
+    return df, columns_imputed, df_summary
