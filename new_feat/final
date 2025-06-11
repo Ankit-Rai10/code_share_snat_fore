@@ -131,6 +131,40 @@ def fill_exogeneous_features_v2(df, feature_names, cv_threshold, val_fh, debug=T
         df_summary = pd.concat([df_summary, df_dummy], ignore_index=True)
         columns_imputed.append(column)
 
+
+
+
+------- plotting
+
+if debug:
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    # Plot actual values
+    ax.plot(df_copy['ds'], df_copy['y'], label='Actual', color='black', linewidth=2)
+
+    # Plot validation forecasts
+    for model_name in uni_models.keys():
+        if model_name in forecast_val_df.columns:
+            ax.plot(forecast_val_df['ds'], forecast_val_df[model_name],
+                    linestyle='--', label=f'Val Forecast - {model_name}')
+
+    # Plot test forecasts
+    for model_name in uni_models.keys():
+        if model_name in forecast_test_df.columns:
+            ax.plot(forecast_test_df['ds'], forecast_test_df[model_name],
+                    linestyle='-', label=f'Test Forecast - {model_name}')
+
+    # Mark forecast start
+    ax.axvline(x=df_copy['ds'].iloc[len(df_copy) - n_nan], color='red', linestyle='--', label='Forecast Start')
+
+    ax.set_title(f'{column} - Forecast Comparison Across Models')
+    ax.set_xlabel("Date")
+    ax.legend()
+    ax.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
     print("Imputed columns:", columns_imputed)
     if debug:
         print("Summary:\n", df_summary)
