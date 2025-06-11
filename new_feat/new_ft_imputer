@@ -1,115 +1,115 @@
-from statsforecast import StatsForecast
-from statsforecast.models import AutoARIMA, AutoETS
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from mlforecast.forecast import MLForecast
+from mlforecast.target_transforms import RollingMean
+from mlforecast.automl.forecast import AutoMLForecast
+import optuna
+from xgboost import XGBRegressor
 
 def fill_exogeneous_features_v2(df, feature_names, cv_threshold, val_fh, debug=True):
-    ''' Creating exogeneous feature values and returning nof values imputed for each features
-    assuming there are no intermittent values between lagged time period & max time period for channels '''
-    # this code piece should have the df
     unique_id = df['unique_id'].unique()[0]
     columns_imputed = []
     df_summary = pd.DataFrame()
-    use_exo = False
-#     if 'n_holidays' in df.columns:
-#         use_exo = True
-    
+
+    n_trials = 10
+    n_parallel = 1
+    seed = 42
+    lags_to_consider = [1, 2, 3, 4, 12]
+    uni_models = {'xgboost': XGBRegressor(n_estimators=100, random_state=42)}
+
     for column in feature_names:
-        if debug == True:
+        if debug:
             print(df[[column, 'ds']].tail(20))
         series = df[column]
         first_valid_pos1 = series.first_valid_index()
-        if debug == True:
+        if debug:
             print('first_valid_pos1 : ', first_valid_pos1)
         series.iloc[:first_valid_pos1] = 0
-#         print(df[['ds', column]])
-#         df.loc[:first_valid_pos1]
         nan_pos = series.isna().idxmax() if series.isna().any() else None
-        if debug == True:
+        if debug:
             print(column)
+
         if nan_pos is not None:
-            
             n_nan = series.iloc[nan_pos:].isna().sum()
-            if debug == True:
+            if debug:
                 print("n_nan : ", n_nan)
-            prev_values = series.iloc[max(0, nan_pos- 13 ) : nan_pos]
-            if debug == True:
-                print(prev_values)
-#             mean_np = np.mean(prev_values.values)
-#             std_dev_np = np.std(prev_values.values, ddof=1)  # ddof=1 for sample standard deviation
-            
 
-            model_used = 'AutoARIMA'
-            if debug == True:
-                print('forecasting using '+model_used)
-            if use_exo:
-                if debug == True:
-                    print('using exogenous n_holidays for forecasting')
-                df_copy = df[~df[column].isna()][['ds', 'unique_id', column, 'n_holidays']].copy()
-                X_df = df[df[column].isna()][['ds', 'unique_id', 'n_holidays']].copy()
-                if debug == True:
-                    print("X_df : ", X_df)
-            else:
-                if debug == True:
-                    print('not using exogenous n_holidays for forecasting')
-                df_copy = df[~df[column].isna()][['ds', 'unique_id', column]].copy()                
-            df_copy.rename({column:'y'}, axis =1, inplace=True)
+            # Prepare dataset
+            df_copy = df[['ds', 'unique_id', column]].copy()
+            df_copy.rename(columns={column: 'y'}, inplace=True)
 
-            sf = StatsForecast(
-                models=[AutoARIMA(season_length = 5)],#, AutoETS(season_length = 5)],
+            # Split into train, val, test
+            train_data = df_copy.iloc[:len(df_copy)-n_nan-val_fh]
+            val_data = df_copy.iloc[len(df_copy)-n_nan-val_fh:len(df_copy)-n_nan]
+            test_data = df_copy.iloc[len(df_copy)-n_nan:]
+            train_holdout_data = pd.concat([train_data, val_data])
+
+            if debug:
+                print(f"Train: {train_data.shape}, Val: {val_data.shape}, Test: {test_data.shape}")
+
+            # Define AutoMLForecast config
+            def my_init_config(trial):
+                return {
+                    'lags': lags_to_consider,
+                    'date_features': ['month', 'week'],
+                    'lag_transforms': {1: [RollingMean(window_size=4)]}
+                }
+
+            def my_fit_config(trial):
+                return {
+                    'static_features': [],
+                }
+
+            fcst = AutoMLForecast(
+                models=uni_models,
                 freq='W-FRI',
-                )
-            
-            # implementing the univariate forecasting methods
-            ## splitting df into train, holdout and validation
-            
-            print('------------------------------------splitting data for ML models----------------------------')
-            df_copy_ml = df[['ds','unique_id',column]].copy()
-            val_fh = 4
-            train_df_copy = df_copy_ml.iloc[:len(df_copy_ml)-n_nan-val_fh]
-            print('Done Splitting train: size = ',train_df_copy.shape)
-            val_df_copy = df_copy_ml.iloc[len(df_copy_ml)-n_nan-val_fh:].head(val_fh)
-            print('Done Splitting validation: size = ',val_df_copy.shape)
-            test_df_copy = df_copy_ml[len(df_copy_ml)-n_nan:]
-            print('Done Splitting test: size = ',test_df_copy.shape)
-            print('----------------------------------------splitting completed---------------------------------------')
-            print('-----------------------------------performing univariate forecast ---------------------------')
-            
-            
-            
-            # statsforecast + CV + autoETS , AutoARIMA, model3
+                num_threads=n_parallel,
+                init_config=my_init_config,
+                fit_config=my_fit_config
+            ).fit(
+                train_data[['ds', 'unique_id', 'y']],
+                n_windows=3,
+                h=val_fh,
+                num_samples=n_trials,
+                fitted=True,
+                study_kwargs={'sampler': optuna.samplers.TPESampler(seed=seed)}
+            )
 
-    #                 if 'n_holidays' in df.columns:
-            if use_exo == True:
-                if debug == True:
-                    print('ARIMA using exogenous holidays')
-                sf.fit(df_copy)
-                forecast_df = sf.predict(h=n_nan, X_df = X_df)
-            else:
-                if debug == True:
-                    print('ARIMA not using exogenous holidays')
-                sf.fit(df_copy)
-                forecast_df = sf.predict(h=n_nan)
+            # Retrain on full train + val data
+            models_to_retrain = {
+                model_name: fcst.models_[model_name].models_[model_name]
+                for model_name in fcst.models_
+            }
 
-            df_check = pd.concat([df_copy, forecast_df])
-            if debug == True:
-                plt.figure()
-                plt.plot(df_check['ds'], df_check['y'] , label=column)
-                plt.plot(df_check['ds'], df_check[model_used], label=model_used+' forecast')
-#                 plt.plot(df_check['ds'], df_check['AutoETS'], label='AutoETS forecast')
+            fcst_final = MLForecast(
+                models=models_to_retrain,
+                lags=lags_to_consider,
+                date_features=['month', 'week'],
+                freq='W-FRI',
+            ).fit(train_holdout_data[['ds', 'unique_id', 'y']], static_features=[], fitted=True)
+
+            forecast_test_df = fcst_final.predict(h=n_nan)
+            forecast_test_df['scenario'] = 'Org'
+
+            if debug:
+                plt.figure(figsize=(10, 4))
+                plt.plot(df_copy['ds'], df_copy['y'], label='Actual')
+                plt.plot(forecast_test_df['ds'], forecast_test_df['Org'], label='Forecast')
+                plt.axvline(x=df_copy['ds'].iloc[len(df_copy) - n_nan], color='r', linestyle='--', label='Forecast Start')
                 plt.legend()
+                plt.title(f'{column} - Forecast Imputation')
+                plt.grid(True)
                 plt.show()
-    #                 print(forecast_df)
-            replicate = forecast_df[model_used]
-            df[column].iloc[nan_pos:]  = replicate
-#             print(df)
-            if debug == True:
-                print(df[['ds',column]].tail(15))
-    #             n_imputations[column] = n_nan
-            df_dummy = pd.DataFrame({'unique_id':unique_id,'Feature_Name':column, 'n_imputations':n_nan}, pd.Index([0]))
-            df_summary = pd.concat([df_summary, df_dummy], ignore_index=True)
 
+            replicate = forecast_test_df['Org']
+            df[column].iloc[nan_pos:] = replicate.values
+
+            df_dummy = pd.DataFrame({'unique_id': unique_id, 'Feature_Name': column, 'n_imputations': n_nan}, index=[0])
+            df_summary = pd.concat([df_summary, df_dummy], ignore_index=True)
             columns_imputed.append(column)
-        
-    print("output fill exogeneous features for columns : ",columns_imputed)    
-    if debug==True:
-        print("output fill exogeneous features",columns_imputed , df_summary)
+
+    print("output fill exogeneous features for columns: ", columns_imputed)
+    if debug:
+        print("output summary:", df_summary)
     return df, columns_imputed, df_summary
