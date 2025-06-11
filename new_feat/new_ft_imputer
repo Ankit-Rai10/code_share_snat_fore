@@ -57,6 +57,24 @@ def fill_exogeneous_features_v2(df, feature_names, cv_threshold, val_fh, debug=T
                 models=[AutoARIMA(season_length = 5)],#, AutoETS(season_length = 5)],
                 freq='W-FRI',
                 )
+            
+            # implementing the univariate forecasting methods
+            ## splitting df into train, holdout and validation
+            
+            print('------------------------------------splitting data for ML models----------------------------')
+            df_copy_ml = df[['ds','unique_id',column]].copy()
+            val_fh = 4
+            train_df_copy = df_copy_ml.iloc[:len(df_copy_ml)-n_nan-val_fh]
+            print('Done Splitting train: size = ',train_df_copy.shape)
+            val_df_copy = df_copy_ml.iloc[len(df_copy_ml)-n_nan-val_fh:].head(val_fh)
+            print('Done Splitting validation: size = ',val_df_copy.shape)
+            test_df_copy = df_copy_ml[len(df_copy_ml)-n_nan:]
+            print('Done Splitting test: size = ',test_df_copy.shape)
+            print('----------------------------------------splitting completed---------------------------------------')
+            print('-----------------------------------performing univariate forecast ---------------------------')
+            
+            
+            
             # statsforecast + CV + autoETS , AutoARIMA, model3
 
     #                 if 'n_holidays' in df.columns:
@@ -70,8 +88,6 @@ def fill_exogeneous_features_v2(df, feature_names, cv_threshold, val_fh, debug=T
                     print('ARIMA not using exogenous holidays')
                 sf.fit(df_copy)
                 forecast_df = sf.predict(h=n_nan)
-                
-                
 
             df_check = pd.concat([df_copy, forecast_df])
             if debug == True:
