@@ -1,0 +1,99 @@
+from statsforecast import StatsForecast
+from statsforecast.models import AutoARIMA, AutoETS
+
+def fill_exogeneous_features_v2(df, feature_names, cv_threshold, val_fh, debug=True):
+    ''' Creating exogeneous feature values and returning nof values imputed for each features
+    assuming there are no intermittent values between lagged time period & max time period for channels '''
+    # this code piece should have the df
+    unique_id = df['unique_id'].unique()[0]
+    columns_imputed = []
+    df_summary = pd.DataFrame()
+    use_exo = False
+#     if 'n_holidays' in df.columns:
+#         use_exo = True
+    
+    for column in feature_names:
+        if debug == True:
+            print(df[[column, 'ds']].tail(20))
+        series = df[column]
+        first_valid_pos1 = series.first_valid_index()
+        if debug == True:
+            print('first_valid_pos1 : ', first_valid_pos1)
+        series.iloc[:first_valid_pos1] = 0
+#         print(df[['ds', column]])
+#         df.loc[:first_valid_pos1]
+        nan_pos = series.isna().idxmax() if series.isna().any() else None
+        if debug == True:
+            print(column)
+        if nan_pos is not None:
+            
+            n_nan = series.iloc[nan_pos:].isna().sum()
+            if debug == True:
+                print("n_nan : ", n_nan)
+            prev_values = series.iloc[max(0, nan_pos- 13 ) : nan_pos]
+            if debug == True:
+                print(prev_values)
+#             mean_np = np.mean(prev_values.values)
+#             std_dev_np = np.std(prev_values.values, ddof=1)  # ddof=1 for sample standard deviation
+            
+
+            model_used = 'AutoARIMA'
+            if debug == True:
+                print('forecasting using '+model_used)
+            if use_exo:
+                if debug == True:
+                    print('using exogenous n_holidays for forecasting')
+                df_copy = df[~df[column].isna()][['ds', 'unique_id', column, 'n_holidays']].copy()
+                X_df = df[df[column].isna()][['ds', 'unique_id', 'n_holidays']].copy()
+                if debug == True:
+                    print("X_df : ", X_df)
+            else:
+                if debug == True:
+                    print('not using exogenous n_holidays for forecasting')
+                df_copy = df[~df[column].isna()][['ds', 'unique_id', column]].copy()                
+            df_copy.rename({column:'y'}, axis =1, inplace=True)
+
+            sf = StatsForecast(
+                models=[AutoARIMA(season_length = 5)],#, AutoETS(season_length = 5)],
+                freq='W-FRI',
+                )
+            # statsforecast + CV + autoETS , AutoARIMA, model3
+
+    #                 if 'n_holidays' in df.columns:
+            if use_exo == True:
+                if debug == True:
+                    print('ARIMA using exogenous holidays')
+                sf.fit(df_copy)
+                forecast_df = sf.predict(h=n_nan, X_df = X_df)
+            else:
+                if debug == True:
+                    print('ARIMA not using exogenous holidays')
+                sf.fit(df_copy)
+                forecast_df = sf.predict(h=n_nan)
+                
+                
+
+            df_check = pd.concat([df_copy, forecast_df])
+            if debug == True:
+                plt.figure()
+                plt.plot(df_check['ds'], df_check['y'] , label=column)
+                plt.plot(df_check['ds'], df_check[model_used], label=model_used+' forecast')
+#                 plt.plot(df_check['ds'], df_check['AutoETS'], label='AutoETS forecast')
+                plt.legend()
+                plt.show()
+    #                 print(forecast_df)
+            replicate = forecast_df[model_used]
+            df[column].iloc[nan_pos:]  = replicate
+#             print(df)
+            if debug == True:
+                print(df[['ds',column]].tail(15))
+    #             n_imputations[column] = n_nan
+            df_dummy = pd.DataFrame({'unique_id':unique_id,'Feature_Name':column, 'n_imputations':n_nan}, pd.Index([0]))
+            df_summary = pd.concat([df_summary, df_dummy], ignore_index=True)
+
+            columns_imputed.append(column)
+        
+    print("output fill exogeneous features for columns : ",columns_imputed)    
+    if debug==True:
+        print("output fill exogeneous features",columns_imputed , df_summary)
+    return df, columns_imputed, df_summary
