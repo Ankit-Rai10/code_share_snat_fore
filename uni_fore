@@ -1,0 +1,66 @@
+def get_uni_ml_forecasts_auto(train_data, holdout_data, train_holdout_data, future_data, val, fh, lags_to_consider, models, debug=False):
+    ''' get univariate forecasts , can be combined with multi without any featurs but let us include it later'''
+    
+    code = train_data['unique_id'].values[0]
+    code = code.replace('/', '_')
+    def my_init_config(trial: optuna.Trial):
+        lag_transforms = [
+            RollingMean(window_size= 4)
+        ]
+        # lag_to_transform = trial.suggest_categorical('lag_to_transform', [24, 48]) ## way to tune the lags and tranforms
+        return {
+            'lags': lags_to_consider,  # this won't be tuned
+            'date_features': ['month','week'],
+            'lag_transforms': {1: lag_transforms }
+        }
+    def my_fit_config(trial: optuna.Trial):
+        return {
+            'static_features': [],
+            # 'max_horizon':fh ## switched it off because we need to take insample values for ML methods for hierarchical and this would give fh insample values for each ds
+            # 'verbosity':0
+        }
+    fcst= AutoMLForecast(
+        models=uni_models, 
+
+        freq='W-FRI', 
+        # season_length=13,
+        num_threads=n_parallel,
+#         num_threads =1,
+        init_config=my_init_config,
+        fit_config=my_fit_config
+    ).fit(
+        train_data[['ds', 'unique_id','y']],
+        n_windows=3,
+        h=val,
+        num_samples=n_trials, ## n trials to run
+        fitted=True, ## insample forecast return
+        study_kwargs = {'sampler' : optuna.samplers.TPESampler(seed=seed)}, 
+#         optimize_kwargs = {'sampler' : optuna.samplers.TPESampler(seed=seed)}
+    )
+    forecast_holdout_df = fcst.predict(h=val)#  level=[95] parameter for prediction interval
+    train_insample_df = fcst.forecast_fitted_values()
+    if debug == True:
+        print("train_insample_df : ", train_insample_df.tail())
+    models_to_retrain = {}
+    for model1 in fcst.models_:
+        models_to_retrain[model1] = fcst.models_[model1].models_[model1]
+    fcst1 = MLForecast(models = models_to_retrain, lags= lags_to_consider,  # this won't be tuned
+            date_features=  ['month','week'],freq='W-FRI',# num_threads =1,
+            ).fit( train_holdout_data[['ds', 'unique_id','y']],static_features=[], fitted=True)
+
+#     for model1 in fcst.models_:
+#         # print(fcst.models_[model1].models_[model1])
+#         # print(fcst1.models_[model1])
+#         print("same params : ", fcst.models_[model1].models_[model1].get_xgb_params() == fcst1.models_[model1].get_xgb_params())
+#         print('same models : ', fcst.models_[model1].models_[model1] == fcst1.models_[model1])
+    if debug == True:
+        print('pred before retrain ', forecast_holdout_df)
+    forecast_fh_df = fcst1.predict(h=fh)
+    forecast_fh_df['scenario']='Org'
+    train_holdout_insample_df = fcst1.forecast_fitted_values()
+#     if debug == True:
+        #print("train_holdout_insample_df : ", train_holdout_insample_df.tail(10))
+        #print('pred after retrain: ', fcst1.predict(h=fh))
+    assert len(forecast_fh_df) == len(future_data)
+    fcst1.save('./saved_models/uni_ML_Auto_model_'+code)
+    return forecast_holdout_df,train_insample_df, forecast_fh_df, train_holdout_insample_df
