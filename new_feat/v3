@@ -1,0 +1,136 @@
+import optuna
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+from mlforecast import MLForecast
+from mlforecast.target_transforms import RollingMean
+from mlforecast.forecasting import AutoMLForecast
+
+def fill_exogeneous_features_v2(df, feature_names, cv_threshold, val_fh, debug=True):
+    unique_id = df['unique_id'].unique()[0]
+    columns_imputed = []
+    df_summary = pd.DataFrame()
+
+    for column in feature_names:
+        if debug:
+            print(f"\nProcessing: {column}")
+            print(df[[column, 'ds']].tail(10))
+
+        series = df[column]
+        first_valid_pos = series.first_valid_index()
+        if first_valid_pos is not None:
+            series.iloc[:first_valid_pos] = 0
+
+        nan_pos = series.isna().idxmax() if series.isna().any() else None
+        if nan_pos is None:
+            continue  # no missing data to impute
+
+        n_nan = series.iloc[nan_pos:].isna().sum()
+        if debug:
+            print(f"{column} - n_nan: {n_nan}")
+
+        df_copy_ml = df[['ds', 'unique_id', column]].copy()
+        train_data = df_copy_ml.iloc[:len(df_copy_ml) - n_nan - val_fh].copy()
+        val_data = df_copy_ml.iloc[len(df_copy_ml) - n_nan - val_fh:len(df_copy_ml) - n_nan].copy()
+        test_data = df_copy_ml.iloc[-n_nan:].copy()
+        train_holdout_data = df_copy_ml.iloc[:len(df_copy_ml) - n_nan].copy()
+        future_data = test_data.copy()
+
+        train_data = train_data.rename(columns={column: 'y'})
+        val_data = val_data.rename(columns={column: 'y'})
+        train_holdout_data = train_holdout_data.rename(columns={column: 'y'})
+
+        code = train_data['unique_id'].values[0].replace('/', '_')
+        lags_to_consider = [1, 2, 3, 4, 12]
+        n_trials = 10
+        n_parallel = 1
+        seed = 42
+
+        def my_init_config(trial):
+            lag_transforms = [RollingMean(window_size=4)]
+            return {
+                'lags': lags_to_consider,
+                'date_features': ['month', 'week'],
+                'lag_transforms': {1: lag_transforms}
+            }
+
+        def my_fit_config(trial):
+            return {'static_features': []}
+
+        auto_forecaster = AutoMLForecast(
+            models=['xgboost'],
+            freq='W-FRI',
+            num_threads=n_parallel,
+            init_config=my_init_config,
+            fit_config=my_fit_config
+        ).fit(
+            train_data[['ds', 'unique_id', 'y']],
+            n_windows=3,
+            h=val_fh,
+            num_samples=n_trials,
+            fitted=True,
+            study_kwargs={'sampler': optuna.samplers.TPESampler(seed=seed)}
+        )
+
+        forecast_val_df = auto_forecaster.predict(h=val_fh)
+        train_insample_df = auto_forecaster.forecast_fitted_values()
+
+        # Retrain with train + validation
+        models_to_retrain = {
+            m: auto_forecaster.models_[m].models_[m]
+            for m in auto_forecaster.models_
+        }
+
+        fcst1 = MLForecast(
+            models=models_to_retrain,
+            lags=lags_to_consider,
+            date_features=['month', 'week'],
+            freq='W-FRI'
+        ).fit(train_holdout_data[['ds', 'unique_id', 'y']], static_features=[], fitted=True)
+
+        forecast_test_df = fcst1.predict(h=n_nan)
+
+        # Merge predictions with validation data for evaluation
+        merged_val = forecast_val_df.merge(val_data[['ds', 'y']], on='ds', how='left')
+        merged_val = merged_val.dropna(subset=['y', 'xgboost'])
+        merged_val = merged_val[merged_val['y'] != 0]
+
+        mae = mean_absolute_error(merged_val['y'], merged_val['xgboost'])
+        rmse = np.sqrt(mean_squared_error(merged_val['y'], merged_val['xgboost']))
+        mape = np.mean(np.abs((merged_val['y'] - merged_val['xgboost']) / merged_val['y'])) * 100
+
+        # Assign predictions to original df
+        df.loc[df.index >= nan_pos, column] = forecast_test_df['xgboost'].values
+
+        if debug:
+            plt.figure()
+            plt.plot(train_data['ds'], train_data['y'], label='Train')
+            plt.plot(val_data['ds'], val_data['y'], label='Validation')
+            plt.plot(forecast_val_df['ds'], forecast_val_df['xgboost'], label='Val Forecast')
+            plt.plot(forecast_test_df['ds'], forecast_test_df['xgboost'], label='Test Forecast')
+            plt.title(f'Forecast for {column}')
+            plt.xlabel('Date')
+            plt.ylabel(column)
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.show()
+
+        df_dummy = pd.DataFrame({
+            'unique_id': unique_id,
+            'Feature_Name': column,
+            'n_imputations': n_nan,
+            'MAPE': mape,
+            'MAE': mae,
+            'RMSE': rmse
+        }, index=[0])
+        df_summary = pd.concat([df_summary, df_dummy], ignore_index=True)
+        columns_imputed.append(column)
+
+    if debug:
+        print("Final imputation summary:")
+        print(df_summary)
+
+    return df, columns_imputed, df_summary
