@@ -1,0 +1,245 @@
+# ensemble model
+# train with xgb and autoridge and assign weightage then 
+def get_multi_ml_forecasts_ensemble(
+    train_data,
+    holdout_data,
+    train_holdout_data,
+    future_data,
+    val,
+    fh,
+    lags_to_consider,
+    Features_name,
+    base_model_config={'model_name': 'multi-xgb', 'model_class': AutoXGBoost},
+    secondary_model_config={'model_name': 'multi-auto_rifge', 'model_class': AutoRidge},
+    n_parallel=1,
+    seed=42,
+    ensemble_weights=(0.7,0.3),
+    method="weighted"
+):
+
+    """
+
+    Forecasting pipeline using an ensemble of two MLForecast models with weighted predictions
+
+    """
+
+    # Extract model configurations
+    base_model_name = base_model_config['model_name']
+    base_model_class = base_model_config['model_class']
+    secondary_model_name = secondary_model_config['model_name']
+    secondary_model_class = secondary_model_config['model_class']
+    
+    # 1. Initial Base Model Training (Train only)
+    code = train_data['unique_id'].values[0]
+    code = code.replace('/', '_')
+
+    def my_init_config(trial):
+        rolling_window_size = trial.suggest_int('rolling_window_size',2,6)  # Test rolling sizes from 4 to 13
+#             print(rolling_window_size)
+        lag_transforms = [
+            RollingMean(window_size=rolling_window_size)  # Dynamically tune rolling mean
+        ]
+
+
+        # Create a dictionary where lags greater than 6 weeks get transformed
+        lag_transforms_dict = {
+            lag: lag_transforms for lag in lags_to_consider if lag>7
+        }
+
+        return {
+            'lags': lags_to_consider+[1],
+            'lag_transforms': lag_transforms_dict
+        }
+ 
+    def my_fit_config(trial: optuna.Trial):
+        return {'static_features': []}
+ 
+    # Base model training
+    base_fcst = AutoMLForecast(
+        models={base_model_name: base_model_class()},
+        freq='W-FRI',
+        num_threads=n_parallel,
+        init_config=my_init_config,
+        fit_config=my_fit_config
+    ).fit(
+        train_data,
+        n_windows=3,
+        h=4,
+        num_samples=100,
+        fitted=True,
+        study_kwargs={'sampler': optuna.samplers.TPESampler(seed=seed)}
+    )
+ 
+    # 2nd model training
+    secondary_model = AutoMLForecast(
+        models={secondary_model_name: secondary_model_class()},
+        freq='W-FRI',
+        num_threads=n_parallel,
+        init_config=my_init_config,
+        fit_config=my_fit_config
+    ).fit(
+        train_data,
+        n_windows=3,
+        h=4,
+        num_samples=100,
+        fitted=True,
+        study_kwargs={'sampler': optuna.samplers.TPESampler(seed=seed)}
+    )
+
+    # 3. Generate predictions and combine
+    def combine_predictions(base_preds, secondary_preds, base_col, secondary_col, method, weights):
+        combined = base_preds.merge(secondary_preds, on=['ds', 'unique_id'], how='left')
+        w1,w2 = weights
+        combined['ensemble'] = w1*combined[base_col]+w2*combined[secondary_col]
+        return combined.drop(columns=[base_col,secondary_col])
+    
+        # 3. Generate predictions and combine for forecast
+    def combine_predictions_forecast(base_preds, secondary_preds, base_col, secondary_col, method, weights):
+        combined = base_preds.merge(secondary_preds, on=['ds', 'unique_id','scenario'], how='left')
+        w1,w2 = weights
+        combined['ensemble'] = w1*combined[base_col]+w2*combined[secondary_col]
+        return combined.drop(columns=[base_col,secondary_col]) 
+    
+    # Holdout predictions
+    forecast_holdout_df_base = base_fcst.predict(h=val, X_df=holdout_data)
+    forecast_holdout_df_secondary = secondary_model.predict(h=val, X_df=holdout_data)
+    forecast_holdout_df = combine_predictions(
+        forecast_holdout_df_base, 
+        forecast_holdout_df_secondary, 
+        base_model_name, 
+        secondary_model_name,method='weighted',weights=ensemble_weights
+    )
+ 
+    # Insample predictions
+    train_insample_df_base = base_fcst.forecast_fitted_values()
+    train_insample_df_secondary = secondary_model.forecast_fitted_values().drop(columns=['y'])
+    train_insample_df = combine_predictions(
+        train_insample_df_base,
+        train_insample_df_secondary,
+        base_model_name,
+        secondary_model_name, method='weighted', weights=ensemble_weights
+    )
+ 
+    # 4. Retrain on full holdout data
+    models_base = {base_model_name: base_fcst.models_[base_model_name].models_[base_model_name]}
+    base_fcst_hold = MLForecast(
+        models=models_base,
+        lags=lags_to_consider,
+        freq='W-FRI'
+    ).fit(train_holdout_data, static_features=[], fitted=True)
+ 
+    models_secondary = {secondary_model_name: secondary_model.models_[secondary_model_name].models_[secondary_model_name]}
+    secondary_fcst_hold = MLForecast(
+        models=models_secondary,
+        lags=lags_to_consider,
+        freq='W-FRI'
+    ).fit(train_holdout_data, static_features=[], fitted=True)
+ 
+    # Final predictions
+
+    forecast_fh_df_base = base_fcst_hold.predict(h=fh, X_df=future_data)
+    forecast_fh_df_base['scenario']='Org'
+    Features_name = [col for col in future_data.columns if col not in ['ds', 'unique_id','month','week','n_holidays','y_lag_13','Holiday Adjustment', 'Site_Access_Rate','market_share','growth_rate','trend_rate']]
+    
+    for col in Features_name:
+        future_data_mod=future_data.copy()
+        future_data_mod[col]=future_data_mod[col]*1.10
+        forecast_fh_new = base_fcst_hold.predict(h=fh, X_df=future_data_mod)
+        forecast_fh_new['scenario']=col+'_1.10'
+        forecast_fh_df_base=pd.concat([forecast_fh_df_base,forecast_fh_new],axis=0)
+        
+    forecast_fh_df_secondary = secondary_fcst_hold.predict(h=fh, X_df=future_data)
+    forecast_fh_df_secondary['scenario']='Org'
+
+    
+    for col in Features_name:
+        future_data_mod=future_data.copy()
+        future_data_mod[col]=future_data_mod[col]*1.10
+        forecast_fh_new = secondary_fcst_hold.predict(h=fh, X_df=future_data_mod)
+        forecast_fh_new['scenario']=col+'_1.10'
+        forecast_fh_df_secondary=pd.concat([forecast_fh_df_secondary,forecast_fh_new],axis=0)
+        
+    forecast_fh_df = combine_predictions_forecast(
+        forecast_fh_df_base,
+        forecast_fh_df_secondary,
+        base_model_name,
+        secondary_model_name,
+        method="weighted",
+        weights=ensemble_weights
+    )
+
+    train_holdout_insample_df_base = base_fcst_hold.forecast_fitted_values()
+    train_holdout_insample_df_secondary = secondary_fcst_hold.forecast_fitted_values().drop(columns=['y'])
+    train_holdout_insample_df = combine_predictions(
+        train_holdout_insample_df_base,
+        train_holdout_insample_df_secondary,
+        base_model_name,
+        secondary_model_name,
+        method="weighted",
+        weights=ensemble_weights
+    ) 
+    feat_importance_df = pd.DataFrame() 
+    for model_name, model_fcst in zip([base_model_name, secondary_model_name],[base_fcst_hold, secondary_fcst_hold]):
+        print(f'Computing SHAP values for: {model_name}')
+        X = model_fcst.preprocess(train_holdout_data, static_features=[])
+        X_features = X.drop(['ds', 'unique_id','y'],axis=1)
+        model = model_fcst.models_[model_name]
+        explainer = shap.Explainer(model.predict,masker=X_features)
+        shap_values = explainer(X_features)
+        avg_shap = np.abs(shap_values.values).mean(axis=0)
+        shap_df = pd.DataFrame(
+            {
+                'Feature_Name':X_features.columns,
+                'Average_SHAP_value':avg_shap,
+                'model':model_name,
+                'Weight':ensemble_weights[0] if model_name==base_model_name else ensemble_weights[1]
+            }
+        )
+        print(shap_df)
+        shap_df['Average_SHAP_Value'] = shap_df['Average_SHAP_value']*shap_df['Weight']
+        shap_df['Unique_id'] = code
+        feat_importance_df = pd.concat([feat_importance_df,shap_df],ignore_index=False)
+    feat_importance_df = feat_importance_df.groupby(['Feature_Name'],as_index=False).agg({'Average_SHAP_Value':'sum'}).sort_values(by='Average_SHAP_Value',ascending=False).reset_index(drop=True)
+    feat_importance_df['unique_id'] = code
+    feat_importance_df['model'] = 'ensemble'
+    '''
+    for model1 in fcst1.models_:
+        print(model1)
+        X = fcst1.preprocess(train_holdout_data, static_features=[])
+        # X = train_val_data.copy()
+
+        X.drop(['ds', 'unique_id','y'], axis=1, inplace=True)
+        print(X.columns)
+        # 3. SHAP: Explain the feature importance using SHAP values
+        final_model = fcst1.models_[model1]
+        explainer = shap.Explainer(final_model, X)
+        shap_values = explainer(X)
+        print('X.columns : ', X.columns)
+        if show_plots:
+            # Plot SHAP summary plot for feature importance
+            shap.summary_plot(shap_values, X,  plot_type="bar")
+            plt.title('SHAP plot for ' +model1)
+            plt.show()
+        # 4. Compute average SHAP values (absolute values)
+        average_shap_values = np.abs(shap_values.values).mean(axis=0)
+
+        # 5. Create a DataFrame for easier interpretation
+        shap_df = pd.DataFrame({
+            'Feature_Name': X.columns,
+            'Average_SHAP_Value': average_shap_values
+        })
+
+        # Sort features by average SHAP value (importance)
+        shap_df = shap_df.sort_values(by='Average_SHAP_Value', ascending=False)
+        shap_df = shap_df.reset_index()
+        shap_df.drop('index', axis=1, inplace=True)
+
+#         shap_df['cumulative_SHAP']= shap_df['Average_SHAP_Value'].cumsum()
+#         shap_df['cum_imp_percentage']=shap_df['cumulative_SHAP']*100/shap_df['Average_SHAP_Value'].sum()  
+#         print(shap_df)
+        
+        shap_df['unique_id'] = unique_id
+        shap_df['model'] = model1
+        feat_importance_df = pd.concat([feat_importance_df,  shap_df], ignore_index=True)
+    '''
+    return forecast_holdout_df, train_insample_df, forecast_fh_df, train_holdout_insample_df, feat_importance_df
